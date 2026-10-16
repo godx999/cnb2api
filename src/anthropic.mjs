@@ -57,7 +57,7 @@ function neutralize(text) {
   return t;
 }
 
-export function fromAnthropicRequest(body) {
+export function fromAnthropicRequest(body, { allowThinking = false } = {}) {
   if (!body || typeof body !== 'object') throw new ProtocolError('request body must be a JSON object');
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new ProtocolError('messages: must be a non-empty array');
@@ -107,6 +107,16 @@ export function fromAnthropicRequest(body) {
   if (body.tool_choice) {
     const tc = convertToolChoice(body.tool_choice);
     if (tc) out.tool_choice = tc;
+  }
+
+  // 思考开关：默认丢弃（触发上游 thinking 变体会因推理计入 max_tokens 而耗尽预算，
+  // 见 proxy.mjs 的剥除注释）。显式开启时把 Anthropic 顶层 thinking 翻成上游能识别的
+  // OpenAI 侧形态；type:"disabled" 与缺省都不加字段 = 走非 thinking 变体。
+  // budget_tokens 无上游对应字段，不映射 —— 上游按 max_tokens 统一控制推理+正文预算。
+  if (allowThinking && body.thinking && body.thinking.type === 'enabled') {
+    out.thinking = { type: 'enabled' };
+    // 客户端若显式给了 effort（Anthropic 协议外字段，但转发链常见）一并透传
+    if (typeof body.reasoning_effort === 'string') out.reasoning_effort = body.reasoning_effort;
   }
   return out;
 }

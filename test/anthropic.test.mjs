@@ -233,6 +233,30 @@ test('请求转换：thinking 请求参数不泄漏出站（真机教训：触�
   assert.equal(out.messages.length, 1);
 });
 
+test('请求转换：allowThinking 开启时 thinking 映射为上游形态（默认关闭不受影响）', () => {
+  const body = {
+    model: 'claude-sonnet-4-5',
+    max_tokens: 64000,
+    thinking: { type: 'enabled', budget_tokens: 2048 },
+    messages: [{ role: 'user', content: 'hi' }],
+  };
+  // enabled → 透出上游能识别的开关；budget_tokens 无上游对应字段，不映射
+  const on = fromAnthropicRequest(body, { allowThinking: true });
+  assert.deepEqual(on.thinking, { type: 'enabled' });
+  assert.equal(on.budget_tokens, undefined);
+  assert.equal(on.max_tokens, 64000);
+  // type:"disabled" → 不加字段 = 走非 thinking 变体（不是加一个 disabled 开关）
+  const off = fromAnthropicRequest({ ...body, thinking: { type: 'disabled' } }, { allowThinking: true });
+  assert.equal(off.thinking, undefined);
+  assert.equal(off.enable_thinking, undefined);
+  // 不带 thinking 的普通请求两种模式下完全一致
+  const plain = { model: 'claude-sonnet-4-5', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] };
+  assert.deepEqual(fromAnthropicRequest(plain, { allowThinking: true }), fromAnthropicRequest(plain));
+  // 显式开启 + 客户端给了 effort（协议外字段）→ 一并透传
+  const effort = fromAnthropicRequest({ ...body, reasoning_effort: 'high' }, { allowThinking: true });
+  assert.equal(effort.reasoning_effort, 'high');
+});
+
 // ---------------------------------------------------------------------------
 // 非流式响应转换
 // ---------------------------------------------------------------------------

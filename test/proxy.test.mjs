@@ -8,12 +8,16 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const MOCK_PORT = 19101;
 const PROXY_PORT = 19102;
 const KEY = 'test-key-12345';
 // 嗅探注册表状态文件隔离到临时目录：避免污染仓库，也避免上次运行残留使 models 列表漂移
 const STATE_PATH = join(tmpdir(), `cnb2api-models-test-${process.pid}.json`);
+// 仓库根目录：Windows 上 new URL('..').pathname 会得到 "/D:/..."（前导斜杠），
+// spawn 的 cwd 因此非法 → 子进程起不来，全套用例 port not up。fileURLToPath 才是正解。
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 // ---- mock 上游：完整 SSE（usage/tool_calls/finish_reason）+ 可选慢响应 ----
 const upstreamState = { clientAborted: false, lastBody: null };
@@ -90,7 +94,7 @@ async function waitPort(port, timeoutMs = 5000) {
 
 function startProxy(env = {}) {
   return spawn(process.execPath, ['src/server.mjs'], {
-    cwd: new URL('..', import.meta.url).pathname,
+    cwd: REPO_ROOT,
     env: { ...process.env, PROXY_PORT: String(PROXY_PORT), PROXY_KEY: KEY, CNB_REPO_SLUG: 'test/repo', CNB_TOKEN: 'test-token', UPSTREAM_OVERRIDE: `http://127.0.0.1:${MOCK_PORT}`, PROXY_UPSTREAM_TIMEOUT_MS: '400', PROXY_IDLE_TIMEOUT_MS: '400', PROXY_MODELS_STATE: STATE_PATH, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -419,10 +423,108 @@ test('reasoning_effort 出站剥除（真机教训：触发上游 thinking 变�
 
 test('超时环境变量非法值 → 启动即拒（fail-fast，回归：NaN 曾使 setTimeout 按 0ms 触发、每条流瞬间 abort）', async () => {
   const bad = spawn(process.execPath, ['src/server.mjs'], {
-    cwd: new URL('..', import.meta.url).pathname,
+    cwd: REPO_ROOT,
     env: { ...process.env, PROXY_PORT: String(PROXY_PORT + 1), PROXY_KEY: KEY, CNB_REPO_SLUG: 'test/repo', CNB_TOKEN: 'test-token', UPSTREAM_OVERRIDE: `http://127.0.0.1:${MOCK_PORT}`, PROXY_IDLE_TIMEOUT_MS: 'abc' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const code = await new Promise((r) => bad.on('exit', (c) => r(c)));
   assert.equal(code, 1, 'must refuse to start with a non-numeric timeout');
+});
+
+// ---------------------------------------------------------------------------
+// 思考能力 opt-in（CNB2API_ALLOW_THINKING）：放行开关 + max_tokens 预算兜底
+//
+// 根因不是"上游不支持思考"，而是 thinking 变体把推理阶段计入 max_tokens：
+// 预算不足 → finish_reason=length + content 全空。开关与预算必须成对放开。
+// 默认（不开 opt-in）行为由上方的剥除测试钉死，这里只测开启后的增量行为。
+// ---------------------------------------------------------------------------
+const THINK_PORT = PROXY_PORT + 3;
+const THINK_STATE = join(tmpdir(), `cnb2api-think-test-${process.pid}.json`);
+
+async function withThinkingProxy(env, fn) {
+  const p = spawn(process.execPath, ['src/server.mjs'], {
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env, PROXY_PORT: String(THINK_PORT), PROXY_KEY: KEY, CNB_REPO_SLUG: 'test/repo', CNB_TOKEN: 'test-token',
+      UPSTREAM_OVERRIDE: `http://127.0.0.1:${MOCK_PORT}`, PROXY_MODELS_STATE: THINK_STATE, ...env,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    await waitPort(THINK_PORT);
+    return await fn();
+  } finally {
+    p.kill('SIGTERM');
+  }
+}
+
+function chatOn(port, payload) {
+  return fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${KEY}` },
+    body: JSON.stringify(payload),
+  });
+}
+
+test('思考 opt-in：CNB2API_ALLOW_THINKING=1 时思考开关透传上游', async () => {
+  await withThinkingProxy({ CNB2API_ALLOW_THINKING: '1' }, async () => {
+    const r = await chatOn(THINK_PORT, { model: 'mock-model', messages: [{ role: 'user', content: 'hi' }], stream: false, reasoning_effort: 'high' });
+    assert.equal(r.status, 200);
+    await r.json();
+    assert.equal(upstreamState.lastBody.reasoning_effort, 'high', 'opt-in must forward the toggle');
+    assert.equal(upstreamState.lastBody.model, 'mock-model', 'other fields untouched');
+
+    const r2 = await chatOn(THINK_PORT, { model: 'mock-model', messages: [], stream: true, thinking: { type: 'enabled' } });
+    await r2.text();
+    assert.deepEqual(upstreamState.lastBody.thinking, { type: 'enabled' }, 'streaming path must forward too');
+  });
+});
+
+test('思考 opt-in：预算兜底只抬高不压低（推理吃穿 max_tokens 是空答案的根因）', async () => {
+  await withThinkingProxy({ CNB2API_ALLOW_THINKING: '1', CNB2API_THINKING_MIN_MAX_TOKENS: '32000' }, async () => {
+    // 客户端预算低于下限（典型 claude code 2048/8192）→ 抬到下限
+    const r = await chatOn(THINK_PORT, { model: 'mock-model', messages: [], stream: false, max_tokens: 2048, thinking: { type: 'enabled' } });
+    await r.json();
+    assert.equal(upstreamState.lastBody.max_tokens, 32000, 'floor must lift an under-budget request');
+
+    // 客户端预算高于下限 → 原样保留
+    const r2 = await chatOn(THINK_PORT, { model: 'mock-model', messages: [], stream: false, max_tokens: 60000, thinking: { type: 'enabled' } });
+    await r2.json();
+    assert.equal(upstreamState.lastBody.max_tokens, 60000, 'floor must never lower a bigger budget');
+
+    // 未带 max_tokens → 补下限（避免上游用极小默认值）
+    const r3 = await chatOn(THINK_PORT, { model: 'mock-model', messages: [], stream: false, thinking: { type: 'enabled' } });
+    await r3.json();
+    assert.equal(upstreamState.lastBody.max_tokens, 32000);
+  });
+});
+
+test('思考 opt-in：不设预算下限时完全交由客户端控制 max_tokens', async () => {
+  await withThinkingProxy({ CNB2API_ALLOW_THINKING: '1' }, async () => {
+    const r = await chatOn(THINK_PORT, { model: 'mock-model', messages: [], stream: false, max_tokens: 2048, reasoning_effort: 'low' });
+    await r.json();
+    assert.equal(upstreamState.lastBody.max_tokens, 2048, 'no floor configured → pass through unchanged');
+  });
+});
+
+test('思考 opt-in：CNB2API_THINKING_MIN_MAX_TOKENS 非法值 → 启动即拒（fail-fast）', async () => {
+  const bad = spawn(process.execPath, ['src/server.mjs'], {
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env, PROXY_PORT: String(THINK_PORT + 1), PROXY_KEY: KEY, CNB_REPO_SLUG: 'test/repo', CNB_TOKEN: 'test-token',
+      UPSTREAM_OVERRIDE: `http://127.0.0.1:${MOCK_PORT}`, CNB2API_ALLOW_THINKING: '1', CNB2API_THINKING_MIN_MAX_TOKENS: 'abc',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const code = await new Promise((r) => bad.on('exit', (c) => r(c)));
+  assert.equal(code, 1, 'must refuse to start with a non-numeric budget floor');
+});
+
+test('思考 opt-in：默认关闭时预算兜底不生效（开关与预算必须成对）', async () => {
+  await withThinkingProxy({ CNB2API_THINKING_MIN_MAX_TOKENS: '32000' }, async () => {
+    const r = await chatOn(THINK_PORT, { model: 'mock-model', messages: [], stream: false, max_tokens: 2048, reasoning_effort: 'high' });
+    await r.json();
+    assert.equal(upstreamState.lastBody.reasoning_effort, undefined, 'toggle still stripped without opt-in');
+    assert.equal(upstreamState.lastBody.max_tokens, 2048, 'floor is inert without opt-in');
+  });
 });
