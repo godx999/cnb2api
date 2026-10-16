@@ -21,6 +21,17 @@ export const config = {
   idleTimeoutMs: Number(process.env.PROXY_IDLE_TIMEOUT_MS || 300_000),        // per-stream idle cap (reset each chunk)
   authFailWindowMs: 60_000,
   authFailMax: 10,
+  // ---- 思考能力（thinking / reasoning）开关 ----
+  // 默认关闭：出站统一剥除 reasoning_effort/reasoning/enable_thinking/thinking，
+  // 锁定上游非 thinking 变体（历史默认行为，保持向后兼容）。
+  // 置 '1' 时放行这四个开关，客户端可命中上游 thinking 变体，拿到 reasoning_content。
+  // ⚠️ 上游 thinking 变体把推理阶段也计入 max_tokens：预算不足时推理吃穿预算，
+  //    finish_reason=length 且 content 全空（真机实测 2048/8192 必现，60000 正常）。
+  //    因此开启本开关时强烈建议同时设置 THINKING_MIN_MAX_TOKENS 兜底。
+  allowThinking: process.env.CNB2API_ALLOW_THINKING === '1',
+  // allowThinking 生效时给 max_tokens 的兜底下限（0 = 不兜底，完全交由客户端控制）。
+  // 仅抬高、不压低：客户端已给出更大的 max_tokens 时原样保留。
+  thinkingMinMaxTokens: Number(process.env.CNB2API_THINKING_MIN_MAX_TOKENS || 0),
   upstreamUrl: '',
 };
 
@@ -50,4 +61,14 @@ for (const [key, env] of [['upstreamTimeoutMs', 'PROXY_UPSTREAM_TIMEOUT_MS'], ['
     console.error(`[config] ${env} must be a positive number (ms), got "${process.env[env]}". Refusing to start.`);
     process.exit(1);
   }
+}
+// thinkingMinMaxTokens 允许 0（= 不兜底），但不允许 NaN/负数：NaN 会让 floor 比较恒为
+// false 而静默失效，负数无意义，两者都在启动时拒掉而不是带病运行。
+if (!Number.isFinite(config.thinkingMinMaxTokens) || config.thinkingMinMaxTokens < 0) {
+  console.error(`[config] CNB2API_THINKING_MIN_MAX_TOKENS must be a non-negative number (0 = disabled), got "${process.env.CNB2API_THINKING_MIN_MAX_TOKENS}". Refusing to start.`);
+  process.exit(1);
+}
+if (config.thinkingMinMaxTokens > 0 && !config.allowThinking) {
+  // 不是错误，但几乎一定是配置漏了一半：没有 allowThinking，预算兜底永远不会生效
+  console.warn('[config] CNB2API_THINKING_MIN_MAX_TOKENS is set but CNB2API_ALLOW_THINKING != "1"; the budget floor will never apply.');
 }

@@ -13,10 +13,24 @@ import { observe as observeModel } from './models.mjs';
 const REASONING_TRIGGERS = ['reasoning_effort', 'reasoning', 'enable_thinking', 'thinking'];
 
 function stripReasoningTriggers(payload) {
+  // 显式开启思考（CNB2API_ALLOW_THINKING=1）：放行开关，命中上游 thinking 变体。
+  // 预算兜底由 applyThinkingBudgetFloor 负责，二者必须成对使用（见 config.mjs）。
+  if (config.allowThinking) return payload;
   if (!REASONING_TRIGGERS.some((k) => k in payload)) return payload;
   const out = { ...payload };
   for (const k of REASONING_TRIGGERS) delete out[k];
   return out;
+}
+
+// 上游 thinking 变体把推理阶段计入 max_tokens：只放开开关而不给足预算，推理会吃穿
+// 预算 → finish_reason=length、content 全空（真机实测 2048/8192 必现，60000 正常出答案）。
+// 这里按配置给一个下限兜底：只抬高、不压低，客户端给了更大的预算就原样保留。
+function applyThinkingBudgetFloor(payload) {
+  const floor = config.thinkingMinMaxTokens;
+  if (!config.allowThinking || !floor) return payload;
+  const cur = typeof payload.max_tokens === 'number' ? payload.max_tokens : 0;
+  if (cur >= floor) return payload;
+  return { ...payload, max_tokens: floor };
 }
 
 export async function forward({ reqId, payload, wantStream, res, transform }) {
@@ -36,7 +50,7 @@ export async function forward({ reqId, payload, wantStream, res, transform }) {
     up = await fetch(config.upstreamUrl, {
       method: 'POST',
       headers: { Authorization: `Bearer ${config.upstreamToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...stripReasoningTriggers(payload), stream: true }),
+      body: JSON.stringify({ ...applyThinkingBudgetFloor(stripReasoningTriggers(payload)), stream: true }),
       signal: ac.signal,
     });
   } catch (e) {
