@@ -109,16 +109,30 @@ export function fromAnthropicRequest(body, { allowThinking = false } = {}) {
     if (tc) out.tool_choice = tc;
   }
 
-  // 思考开关：默认丢弃（触发上游 thinking 变体会因推理计入 max_tokens 而耗尽预算，
-  // 见 proxy.mjs 的剥除注释）。显式开启时把 Anthropic 顶层 thinking 翻成上游能识别的
-  // OpenAI 侧形态；type:"disabled" 与缺省都不加字段 = 走非 thinking 变体。
-  // budget_tokens 无上游对应字段，不映射 —— 上游按 max_tokens 统一控制推理+正文预算。
+  // 思考开关：默认丢弃（触发上游思考变体会因推理计入 max_tokens 而耗尽预算，
+  // 见 proxy.mjs 的剥除注释）。显式开启时把 Anthropic 顶层 thinking 翻成上游能识别的形态；
+  // type:"disabled" 与缺省都不加字段 = 走非思考变体。
+  //
+  // ⚠️ 真机实测（2026-10-16，对 CNB 上游逐个拼写验证）：上游**只认 `reasoning_effort`**。
+  //    `thinking:{type:"enabled"}`、`enable_thinking:true`、`reasoning:{effort}`、`thinking:true`
+  //    全部无效 —— reasoning_content 恒为 0，与不带任何思考参数的表现完全一致。
+  //    所以这里必须映射成 reasoning_effort；映射成 thinking 会让 /v1/messages 永远拿不到思考。
+  //    Anthropic 的 budget_tokens 无上游对应字段，按档位折算成 effort。
   if (allowThinking && body.thinking && body.thinking.type === 'enabled') {
-    out.thinking = { type: 'enabled' };
-    // 客户端若显式给了 effort（Anthropic 协议外字段，但转发链常见）一并透传
-    if (typeof body.reasoning_effort === 'string') out.reasoning_effort = body.reasoning_effort;
+    out.reasoning_effort = typeof body.reasoning_effort === 'string'
+      ? body.reasoning_effort // 客户端显式给了 effort（协议外字段，但转发链常见）→ 原样透传
+      : budgetToEffort(body.thinking.budget_tokens);
   }
   return out;
+}
+
+// Anthropic thinking.budget_tokens → 上游 reasoning_effort 档位。
+// 上游只分 low/medium/high（实测三档都能触发思考，档位差异表现在 reasoning 长度上）。
+function budgetToEffort(budget) {
+  if (typeof budget !== 'number' || !Number.isFinite(budget)) return 'high'; // 没给预算就按高档
+  if (budget <= 4096) return 'low';
+  if (budget <= 16384) return 'medium';
+  return 'high';
 }
 
 function normalizeSystem(system) {

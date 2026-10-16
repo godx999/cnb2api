@@ -5,11 +5,18 @@ import { aggregate } from './sse.mjs';
 import { record as recordUsage } from './usage.mjs';
 import { observe as observeModel } from './models.mjs';
 
-// 出站请求剥除思考开关：带 reasoning_effort 等思考参数时上游路由到 thinking 变体，
-// 而该变体把推理阶段也计入 max_tokens——推理吃满预算后 finish_reason=length、
-// content 全空（答案永不生成，真机实测 2048/8192 token 必现）。上游无正确开关可配，
-// 出站统一剥除、锁定非 thinking 变体（与 /v1/messages 请求侧丢弃 thinking 块同一策略）。
-// 表驱动：上游若引入新的思考开关命名，往这张表加一项即可。
+// 出站请求剥除思考开关：带上思考参数命中上游思考变体后，推理阶段也计入 max_tokens——
+// 推理吃满预算后 finish_reason=length、content 全空（答案永不生成，真机实测 2048/8192 必现、
+// 给到 32000 才正常）。所以默认出站统一剥除、锁定非思考变体（与 /v1/messages 请求侧丢弃
+// thinking 块同一策略）；显式开启思考由 CNB2API_ALLOW_THINKING 控制。
+//
+// ⚠️ 真机实测（2026-10-16，逐个拼写打到真实上游）：
+//    只有 `reasoning_effort` 能触发思考变体；`reasoning:{effort}`、`enable_thinking`、
+//    `thinking:{type:"enabled"}`、`thinking:true` 全部无效（reasoning_content 恒为 0，
+//    与完全不带思考参数的表现一致）。因此：
+//      - 对外（OpenAI 路径）→ 客户端给 reasoning_effort 即可；
+//      - 对 Anthropic 路径 → anthropic.mjs 把 thinking 映射成 reasoning_effort（不能映射成 thinking）。
+//    剥除列表仍保留全部 4 个拼写：多余剥除无害，且能防上游将来引入新的有效拼写。
 const REASONING_TRIGGERS = ['reasoning_effort', 'reasoning', 'enable_thinking', 'thinking'];
 
 function stripReasoningTriggers(payload) {
