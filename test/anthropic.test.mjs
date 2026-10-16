@@ -233,28 +233,44 @@ test('请求转换：thinking 请求参数不泄漏出站（真机教训：触�
   assert.equal(out.messages.length, 1);
 });
 
-test('请求转换：allowThinking 开启时 thinking 映射为上游形态（默认关闭不受影响）', () => {
+test('请求转换：allowThinking 开启时 thinking 映射为 reasoning_effort（默认关闭不受影响）', () => {
   const body = {
     model: 'claude-sonnet-4-5',
     max_tokens: 64000,
     thinking: { type: 'enabled', budget_tokens: 2048 },
     messages: [{ role: 'user', content: 'hi' }],
   };
-  // enabled → 透出上游能识别的开关；budget_tokens 无上游对应字段，不映射
+  // ⚠️ 真机实测：上游只认 reasoning_effort；thinking:{type:"enabled"} 打到真实上游
+  // reasoning_content 恒为 0（与不带参数一致）。所以必须映射成 reasoning_effort。
   const on = fromAnthropicRequest(body, { allowThinking: true });
-  assert.deepEqual(on.thinking, { type: 'enabled' });
-  assert.equal(on.budget_tokens, undefined);
+  assert.equal(on.reasoning_effort, 'low', 'budget 2048 → low');
+  assert.equal(on.thinking, undefined, 'must NOT emit thinking: upstream ignores it');
+  assert.equal(on.enable_thinking, undefined);
   assert.equal(on.max_tokens, 64000);
-  // type:"disabled" → 不加字段 = 走非 thinking 变体（不是加一个 disabled 开关）
+  assert.equal(on.budget_tokens, undefined);
+
+  // budget_tokens 档位折算
+  const at = (b) => fromAnthropicRequest({ ...body, thinking: { type: 'enabled', budget_tokens: b } }, { allowThinking: true }).reasoning_effort;
+  assert.equal(at(1024), 'low');
+  assert.equal(at(4096), 'low');
+  assert.equal(at(4097), 'medium');
+  assert.equal(at(16384), 'medium');
+  assert.equal(at(16385), 'high');
+  assert.equal(at(31999), 'high');
+  // 缺省/非法 budget → high（宁可高不要低，低了推理写不完会吃穿 max_tokens）
+  assert.equal(at(undefined), 'high');
+  assert.equal(at(NaN), 'high');
+
+  // type:"disabled" → 不加字段 = 走非思考变体（不是加一个 disabled 开关）
   const off = fromAnthropicRequest({ ...body, thinking: { type: 'disabled' } }, { allowThinking: true });
+  assert.equal(off.reasoning_effort, undefined);
   assert.equal(off.thinking, undefined);
-  assert.equal(off.enable_thinking, undefined);
   // 不带 thinking 的普通请求两种模式下完全一致
   const plain = { model: 'claude-sonnet-4-5', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] };
   assert.deepEqual(fromAnthropicRequest(plain, { allowThinking: true }), fromAnthropicRequest(plain));
-  // 显式开启 + 客户端给了 effort（协议外字段）→ 一并透传
-  const effort = fromAnthropicRequest({ ...body, reasoning_effort: 'high' }, { allowThinking: true });
-  assert.equal(effort.reasoning_effort, 'high');
+  // 客户端显式给了 effort（协议外字段）→ 优先用它，忽略 budget_tokens
+  const effort = fromAnthropicRequest({ ...body, reasoning_effort: 'medium' }, { allowThinking: true });
+  assert.equal(effort.reasoning_effort, 'medium');
 });
 
 // ---------------------------------------------------------------------------
@@ -413,11 +429,14 @@ const MOCK_PORT = 19121;
 const PROXY_PORT = 19122;
 const KEY = 'test-key-12345';
 
+let lastUpstreamBody = null; // 捕获出站请求体（思考开关映射类断言用）
+
 const mockServer = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
     const parsed = JSON.parse(body);
+    lastUpstreamBody = parsed;
     // 断言：打到上游的一定是 OpenAI 格式（翻译正确性）
     assert.ok(Array.isArray(parsed.messages));
     assert.equal(parsed.stream, true);
@@ -563,4 +582,66 @@ test('E2E 请求校验：messages 缺失 → 400 Anthropic error envelope', asyn
   const body = await res.json();
   assert.equal(body.type, 'error');
   assert.equal(body.error.type, 'invalid_request_error');
+});
+
+// ---------------------------------------------------------------------------
+// E2E：思考 opt-in —— /v1/messages 的 thinking 必须落到上游的 reasoning_effort
+//
+// 真机实测（2026-10-16）：上游只认 reasoning_effort；thinking:{type:"enabled"} 打到真实
+// 上游 reasoning_content 恒为 0。这条 E2E 钉住"映射成 reasoning_effort"这个事实，
+// 防止未来重构把它改回 thinking（那会让 /v1/messages 静默失去思考）。
+// ---------------------------------------------------------------------------
+const THINK_PORT = PROXY_PORT + 1;
+
+async function withThinkProxy(fn) {
+  const p = spawn(process.execPath, ['src/server.mjs'], {
+    env: {
+      ...process.env, PROXY_KEY: KEY, CNB_REPO_SLUG: 'test/repo', CNB_TOKEN: 'test-token',
+      UPSTREAM_OVERRIDE: `http://127.0.0.1:${MOCK_PORT}/upstream`, PROXY_PORT: String(THINK_PORT),
+      CNB2API_ALLOW_THINKING: '1',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const t0 = Date.now();
+    for (;;) {
+      try { await fetch(`http://127.0.0.1:${THINK_PORT}/health`); break; } catch {}
+      if (Date.now() - t0 > 5000) throw new Error('think proxy not up');
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return await fn();
+  } finally {
+    p.kill('SIGTERM');
+  }
+}
+
+test('E2E 思考 opt-in：thinking:{enabled,budget_tokens} → 上游收到 reasoning_effort（不是 thinking）', async () => {
+  await withThinkProxy(async () => {
+    const res = await fetch(`http://127.0.0.1:${THINK_PORT}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': KEY },
+      body: JSON.stringify({
+        model: 'claude-x', max_tokens: 64000,
+        thinking: { type: 'enabled', budget_tokens: 31999 },
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    assert.equal(res.status, 200);
+    await res.json();
+    assert.equal(lastUpstreamBody.reasoning_effort, 'high', 'budget 31999 → high');
+    assert.equal(lastUpstreamBody.thinking, undefined, 'must not forward thinking: upstream ignores it');
+    assert.equal(lastUpstreamBody.max_tokens, 64000);
+  });
+});
+
+test('E2E 思考 opt-in：未开开关时 thinking 完全不外泄（默认行为不变）', async () => {
+  const res = await postMessages({
+    model: 'claude-x', max_tokens: 64000,
+    thinking: { type: 'enabled', budget_tokens: 31999 },
+    messages: [{ role: 'user', content: 'hi' }],
+  }, { 'x-api-key': KEY });
+  assert.equal(res.status, 200);
+  await res.json();
+  assert.equal(lastUpstreamBody.reasoning_effort, undefined);
+  assert.equal(lastUpstreamBody.thinking, undefined);
 });
